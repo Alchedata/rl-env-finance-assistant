@@ -3,6 +3,9 @@ numpy==1.26.4
 pandas==2.2.1
 # pandas-ta (not compatible with python 3.11)
 matplotlib==3.8.3
-stable-baselines3[extra]==2.2.1
+# Avoid SB3 Atari extras here; they pull ale-py/shimmy constraints that fail on Python 3.12.
+stable-baselines3==2.2.1
 scikit-learn==1.4.1.post1
 yfinance==0.2.37
+# Deep learning backend for DPO / GRPO trainers
+torch>=2.0.0

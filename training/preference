@@ -1,0 +1,211 @@
+"""
+Preference Collector — collects trajectory pairs for DPO training.
+
+Generates preference data by running two policies (or the same policy with
+different seeds) and labeling which trajectory is preferred based on
+episode return.
+"""
+import numpy as np
+from typing import List, Optional
+
+from env.financial_env import FinancialAssistantEnv, generate_dummy_data
+
+
+class PreferenceCollector:
+    """
+    Collects (observation, action_chosen, action_rejected) pairs for DPO training.
+
+    Strategy:
+    1. Run policy_1 and policy_2 on the same environment seed
+    2. Compare episode returns to determine preference
+    3. Store (obs, action_winner, action_loser) tuples
+
+    Usage:
+        collector = PreferenceCollector(env)
+        collector.collect(policy_1, policy_2, n_episodes=100)
+        dataset = collector.get_dataset()
+    """
+
+    def __init__(
+        self,
+        env: FinancialAssistantEnv = None,
+        num_days: int = 1260,
+        initial_balance: float = 10000.0,
+        window_size: int = 20,
+    ):
+        self.env = env or FinancialAssistantEnv(
+            df=generate_dummy_data(num_days=num_days),
+            initial_balance=initial_balance,
+            window_size=window_size,
+        )
+        self.preferences: List[dict] = []
+
+    def _run_episode(self, policy_fn, seed: int) -> dict:
+        """
+        Run a single episode with the given policy.
+
+        Args:
+            policy_fn: callable(obs) -> action
+            seed: Random seed for reproducibility
+
+        Returns:
+            dict with 'observations', 'actions', 'total_reward', 'net_worth_history'
+        """
+        obs, info = self.env.reset(seed=seed)
+        done = False
+        observations = []
+        actions = []
+        total_reward = 0.0
+        net_worth_history = [self.env.simulator.net_worth]
+
+        while not done:
+            action = policy_fn(obs)
+            observations.append(obs.copy())
+            actions.append(action.copy())
+            obs, reward, terminated, truncated, info = self.env.step(action)
+            done = terminated or truncated
+            total_reward += reward
+            net_worth_history.append(info.get("net_worth", self.env.simulator.net_worth))
+
+        return {
+            "observations": observations,
+            "actions": actions,
+            "total_reward": total_reward,
+            "net_worth_history": net_worth_history,
+        }
+
+    def collect(
+        self,
+        policy_1,
+        policy_2,
+        n_episodes: int = 50,
+        seed_offset: int = 0,
+    ) -> None:
+        """
+        Collect preference pairs by running both policies on the same seeds.
+
+        Args:
+            policy_1: callable(obs) -> action (first policy)
+            policy_2: callable(obs) -> action (second policy)
+            n_episodes: Number of episodes to run per policy
+            seed_offset: Starting seed offset
+        """
+        for ep in range(n_episodes):
+            seed = seed_offset + ep
+
+            # Run both policies on the same seed
+            traj_1 = self._run_episode(policy_1, seed=seed)
+            traj_2 = self._run_episode(policy_2, seed=seed)
+
+            # Determine preference: higher total reward wins
+            if traj_1["total_reward"] >= traj_2["total_reward"]:
+                winner, loser = traj_1, traj_2
+            else:
+                winner, loser = traj_2, traj_1
+
+            # Store step-level preference pairs
+            n_steps = min(len(winner["observations"]), len(loser["observations"]))
+            for t in range(n_steps):
+                self.preferences.append({
+                    "observation": winner["observations"][t],
+                    "action_chosen": winner["actions"][t],
+                    "action_rejected": loser["actions"][t],
+                    "margin": abs(traj_1["total_reward"] - traj_2["total_reward"]),
+                })
+
+    def collect_from_sb3(
+        self,
+        model_1,
+        model_2,
+        n_episodes: int = 50,
+        seed_offset: int = 0,
+    ) -> None:
+        """
+        Collect preferences from two SB3 models.
+
+        Args:
+            model_1: SB3 model (preferred if better)
+            model_2: SB3 model (rejected if worse)
+            n_episodes: Number of episodes
+            seed_offset: Starting seed offset
+        """
+        def policy_1(obs):
+            action, _ = model_1.predict(obs, deterministic=False)
+            return action
+
+        def policy_2(obs):
+            action, _ = model_2.predict(obs, deterministic=False)
+            return action
+
+        self.collect(policy_1, policy_2, n_episodes, seed_offset)
+
+    def collect_self_play(
+        self,
+        policy_fn,
+        n_episodes: int = 50,
+        seed_offset: int = 0,
+    ) -> None:
+        """
+        Collect preferences by running the same policy with different seeds.
+
+        This creates preference pairs where one trajectory happens to perform
+        better than another, useful for self-improvement loops.
+
+        Args:
+            policy_fn: callable(obs) -> action
+            n_episodes: Number of episode pairs
+            seed_offset: Starting seed offset
+        """
+        for ep in range(n_episodes):
+            seed_a = seed_offset + ep * 2
+            seed_b = seed_offset + ep * 2 + 1
+
+            traj_a = self._run_episode(policy_fn, seed=seed_a)
+            traj_b = self._run_episode(policy_fn, seed=seed_b)
+
+            if traj_a["total_reward"] >= traj_b["total_reward"]:
+                winner, loser = traj_a, traj_b
+            else:
+                winner, loser = traj_b, traj_a
+
+            n_steps = min(len(winner["observations"]), len(loser["observations"]))
+            for t in range(n_steps):
+                self.preferences.append({
+                    "observation": winner["observations"][t],
+                    "action_chosen": winner["actions"][t],
+                    "action_rejected": loser["actions"][t],
+                    "margin": abs(traj_a["total_reward"] - traj_b["total_reward"]),
+                })
+
+    def get_dataset(self) -> dict:
+        """
+        Get the collected preference dataset.
+
+        Returns:
+            dict with numpy arrays:
+                - observations: (N, obs_dim)
+                - actions_chosen: (N, act_dim)
+                - actions_rejected: (N, act_dim)
+                - margins: (N,)
+        """
+        if not self.preferences:
+            return {
+                "observations": np.array([]),
+                "actions_chosen": np.array([]),
+                "actions_rejected": np.array([]),
+                "margins": np.array([]),
+            }
+
+        return {
+            "observations": np.array([p["observation"] for p in self.preferences]),
+            "actions_chosen": np.array([p["action_chosen"] for p in self.preferences]),
+            "actions_rejected": np.array([p["action_rejected"] for p in self.preferences]),
+            "margins": np.array([p["margin"] for p in self.preferences]),
+        }
+
+    def __len__(self) -> int:
+        return len(self.preferences)
+
+    def clear(self) -> None:
+        """Clear all collected preferences."""
+        self.preferences = []

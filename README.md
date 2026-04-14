@@ -21,11 +21,19 @@ rl-env-finance-assistant/
 │   ├── task_generator.py          # Task generator (Difficulty-aware + Multi-asset)
 │   ├── scorer.py                  # Episode comprehensive scorer
 │   └── curriculum_scheduler.py    # Curriculum learning scheduler
+├── training/
+│   ├── __init__.py                # Package initialization and public exports
+│   ├── config.py                  # Unified training configuration
+│   ├── sb3_trainer.py             # SB3 trainer (PPO, SAC, A2C, TD3, DDPG)
+│   ├── preference_collector.py   # Preference data collector for DPO
+│   ├── dpo_trainer.py             # Direct Preference Optimization trainer
+│   └── grpo_trainer.py            # Group Relative Policy Optimization trainer
 ├── utils/
 │   └── metrics.py                 # Evaluation metrics (Returns, Sharpe ratio, Max drawdown, etc.)
 ├── examples/
 │   ├── run_random_agent.py        # Random Agent example
 │   ├── run_training.py            # Stable-Baselines3 PPO training example
+│   ├── run_multi_algo_training.py # Multi-algorithm training demo (PPO, SAC, DPO, GRPO)
 │   ├── run_task_generator_demo.py # Task generator and scorer demo
 │   └── run_enhanced_demo.py       # Enhanced features demo (Macro + News + Curriculum Learning)
 ├── data/                          # Data directory
@@ -343,7 +351,117 @@ model = SAC("MlpPolicy", env, verbose=1)
 model.learn(total_timesteps=50000)
 ```
 
-### 8.4 LLM-based Agent
+### 8.4 Unified Training Module
+
+The `training` package provides a unified interface for multiple algorithms with shared configuration:
+
+```python
+from training.config import TrainingConfig
+from training.sb3_trainer import SB3Trainer
+
+config = TrainingConfig(
+    total_timesteps=50_000,
+    learning_rate=3e-4,
+    include_macro=True,
+    include_news=True,
+)
+
+# Train with any SB3 algorithm: PPO, SAC, A2C, TD3, DDPG
+trainer = SB3Trainer("ppo", config)   # or "sac", "a2c", "td3", "ddpg"
+trainer.train()
+results = trainer.evaluate(n_episodes=10)
+```
+
+**Supported SB3 Algorithms:**
+
+| Algorithm | Type | Best For |
+|-----------|------|----------|
+| `PPO` | On-policy | Stable, general-purpose training |
+| `A2C` | On-policy | Faster than PPO, simpler |
+| `SAC` | Off-policy | Continuous actions, sample-efficient |
+| `TD3` | Off-policy | Continuous control, deterministic policy |
+| `DDPG` | Off-policy | Continuous control (single-action) |
+
+### 8.5 DPO (Direct Preference Optimization)
+
+DPO trains a policy to prefer actions from higher-reward trajectories over lower-reward ones, without needing a reward model:
+
+```python
+from training.config import TrainingConfig
+from training.dpo_trainer import DPOTrainer
+
+config = TrainingConfig(
+    dpo_beta=0.1,          # Regularization strength
+    dpo_n_epochs=10,       # Training epochs
+    batch_size=64,
+)
+
+trainer = DPOTrainer(config)
+
+# Step 1: Collect preference pairs (two policies, same environment)
+trainer.collect_preferences(n_episodes=50)
+
+# Step 2: Train with DPO loss
+trainer.train()
+
+# Step 3: Evaluate
+trainer.evaluate(n_episodes=10)
+```
+
+**DPO Pipeline:**
+1. Run two policies on the same environment seeds
+2. Label which trajectory is preferred (higher return)
+3. Train policy using DPO loss: `L = -E[log σ(β · (log π(a_w|s) - log π(a_l|s)))]`
+
+You can also collect preferences from SB3 models:
+
+```python
+from training.preference_collector import PreferenceCollector
+
+collector = PreferenceCollector(env=env)
+collector.collect_from_sb3(model_1, model_2, n_episodes=50)
+```
+
+### 8.6 GRPO (Group Relative Policy Optimization)
+
+GRPO eliminates the need for a value function by computing advantages from group reward statistics:
+
+```python
+from training.config import TrainingConfig
+from training.grpo_trainer import GRPOTrainer
+
+config = TrainingConfig(
+    grpo_group_size=8,     # Number of action samples per group
+    grpo_clip_range=0.2,   # PPO-style clipping
+    grpo_n_epochs=4,       # Update epochs per iteration
+)
+
+trainer = GRPOTrainer(config)
+
+# Train with GRPO
+trainer.train(n_iterations=20, steps_per_iter=500)
+
+# Evaluate
+trainer.evaluate(n_episodes=10)
+```
+
+**GRPO Pipeline:**
+1. For each observation, sample G actions from the policy
+2. Evaluate each action in the environment
+3. Compute group-relative advantages: `A_i = (R_i - mean(R)) / std(R)`
+4. Update policy using clipped objective with group advantages
+
+**Key advantage:** No critic network needed — simpler architecture, fewer hyperparameters.
+
+### 8.7 Multi-Algorithm Training Demo
+
+```bash
+python examples/run_multi_algo_training.py
+```
+
+Demonstrates training with PPO, SAC, A2C, DPO, and GRPO in a single script.
+
+### 8.8 LLM-based Agent
 
 ```python
 def obs_to_prompt(obs, info):

@@ -321,13 +321,21 @@ rl-env-finance-assistant/
 │   ├── scorer.py                  # EpisodeScorer (episode score report)
 │   ├── task_generator.py          # TaskGenerator (procedural task generation)
 │   └── curriculum_scheduler.py    # CurriculumScheduler (difficulty adjustment)
+├── training/
+│   ├── __init__.py                # Public API exports
+│   ├── config.py                  # TrainingConfig (unified configuration)
+│   ├── sb3_trainer.py             # SB3Trainer (PPO, SAC, A2C, TD3, DDPG)
+│   ├── preference_collector.py    # PreferenceCollector (DPO data collection)
+│   ├── dpo_trainer.py             # DPOTrainer (Direct Preference Optimization)
+│   └── grpo_trainer.py            # GRPOTrainer (Group Relative Policy Optimization)
 ├── utils/
 │   └── metrics.py                 # Performance metrics utilities
 └── examples/
     ├── run_random_agent.py        # Random agent baseline
     ├── run_enhanced_demo.py       # Full demo: macro/news + curriculum + difficulty
     ├── run_task_generator_demo.py # Task generation and scoring demo
-    └── run_training.py            # PPO training example
+    ├── run_training.py            # PPO training example
+    └── run_multi_algo_training.py # Multi-algorithm training demo (PPO, SAC, DPO, GRPO)
 ```
 
 ---
@@ -371,7 +379,47 @@ rl-env-finance-assistant/
 
 **Validation:** All example scripts run successfully; curriculum learning shows difficulty progression.
 
-### Phase 4 — Polish & Extend 🔄
+### Phase 4 — Training Module ✅
+
+**Deliverables:** Unified training module with multiple algorithm support
+
+| Component | Status | File |
+|-----------|--------|------|
+| TrainingConfig | ✅ Complete | `training/config.py` |
+| SB3Trainer (PPO, SAC, A2C, TD3, DDPG) | ✅ Complete | `training/sb3_trainer.py` |
+| PreferenceCollector | ✅ Complete | `training/preference_collector.py` |
+| DPOTrainer (Direct Preference Optimization) | ✅ Complete | `training/dpo_trainer.py` |
+| GRPOTrainer (Group Relative Policy Optimization) | ✅ Complete | `training/grpo_trainer.py` |
+| Multi-algorithm training demo | ✅ Complete | `examples/run_multi_algo_training.py` |
+
+**Training algorithms overview:**
+
+| Algorithm | Type | Key Feature | Trainer |
+|-----------|------|-------------|---------|
+| PPO | On-policy (SB3) | Stable, general-purpose | `SB3Trainer("ppo")` |
+| SAC | Off-policy (SB3) | Sample-efficient, continuous | `SB3Trainer("sac")` |
+| A2C | On-policy (SB3) | Simpler than PPO | `SB3Trainer("a2c")` |
+| TD3 | Off-policy (SB3) | Deterministic policy | `SB3Trainer("td3")` |
+| DDPG | Off-policy (SB3) | Single-action continuous | `SB3Trainer("ddpg")` |
+| DPO | Preference-based | No reward model needed | `DPOTrainer` |
+| GRPO | Group-relative | No critic needed | `GRPOTrainer` |
+
+**DPO pipeline:**
+1. Collect preference pairs by running two policies on the same environment seeds
+2. Label preferred trajectory (higher episode return)
+3. Train policy using DPO loss: `L = -E[log σ(β · (log π(a_w|s) - log π(a_l|s)))]`
+4. Supports reference-free mode and iterative DPO (reference updates after each round)
+
+**GRPO pipeline:**
+1. For each observation, sample G actions from the current policy
+2. Evaluate each action in the environment
+3. Compute group-relative advantages: `A_i = (R_i - mean(R)) / std(R)`
+4. Update policy using clipped PPO-style objective with group advantages
+5. No value function needed — simpler architecture, fewer hyperparameters
+
+**Validation:** Multi-algorithm training demo runs successfully with all 7 algorithms.
+
+### Phase 5 — Polish & Extend 🔄
 
 **Planned work:**
 
@@ -382,6 +430,8 @@ rl-env-finance-assistant/
 - [ ] Multi-agent support (competitive portfolio management)
 - [ ] Weights & Biases / TensorBoard logging integration
 - [ ] Performance benchmarks against buy-and-hold baselines
+- [ ] RLHF integration (reward model training + PPO fine-tuning)
+- [ ] Online DPO (collect preferences during training, not just pre-collected)
 
 ---
 
@@ -393,7 +443,8 @@ rl-env-finance-assistant/
 | numpy | 1.26.4 | Numerical computation |
 | pandas | 2.2.1 | Data manipulation |
 | matplotlib | 3.8.3 | Visualization |
-| stable-baselines3 | 2.2.1 | RL algorithms (PPO, A2C, etc.) |
+| stable-baselines3 | 2.2.1 | RL algorithms (PPO, SAC, A2C, TD3, DDPG) |
+| torch | ≥2.0.0 | Deep learning backend for DPO / GRPO trainers |
 | scikit-learn | 1.4.1 | Feature preprocessing |
 | yfinance | 0.2.37 | Real market data (optional) |
 

@@ -1,0 +1,314 @@
+"""
+SB3 Trainer — unified trainer for Stable-Baselines3 algorithms.
+
+Supports: PPO, SAC, A2C, TD3, DDPG
+"""
+import os
+from typing import Optional
+
+from stable_baselines3 import PPO, SAC, A2C, TD3, DDPG
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.callbacks import (
+    EvalCallback,
+    StopTrainingOnRewardThreshold,
+    CallbackList,
+    BaseCallback,
+)
+from stable_baselines3.common.vec_env import VecEnv
+
+from env.financial_env import FinancialAssistantEnv, generate_dummy_data
+from training.config import TrainingConfig
+
+
+ALGORITHM_MAP = {
+    "ppo": PPO,
+    "sac": SAC,
+    "a2c": A2C,
+    "td3": TD3,
+    "ddpg": DDPG,
+}
+
+# Algorithms that use continuous action spaces (Box)
+CONTINUOUS_ALGORITHMS = {"sac", "td3", "ddpg"}
+
+# Algorithms that support MlpPolicy
+MLP_POLICY = "MlpPolicy"
+
+
+class LoggingCallback(BaseCallback):
+    """Custom callback for logging episode metrics."""
+
+    def __init__(self, verbose: int = 0):
+        super().__init__(verbose)
+        self._episode_rewards = []
+        self._episode_lengths = []
+
+    def _on_step(self) -> bool:
+        for info in self.locals.get("infos", []):
+            if "episode" in info:
+                self._episode_rewards.append(info["episode"]["r"])
+                self._episode_lengths.append(info["episode"]["l"])
+        return True
+
+
+class SB3Trainer:
+    """
+    Unified trainer for Stable-Baselines3 algorithms.
+
+    Supports: PPO, SAC, A2C, TD3, DDPG
+
+    Usage:
+        config = TrainingConfig(total_timesteps=50_000)
+        trainer = SB3Trainer("ppo", config)
+        trainer.train()
+        trainer.evaluate(n_episodes=10)
+    """
+
+    def __init__(self, algorithm: str, config: TrainingConfig = None):
+        """
+        Initialize the SB3 trainer.
+
+        Args:
+            algorithm: One of 'ppo', 'sac', 'a2c', 'td3', 'ddpg'
+            config: Training configuration. Uses defaults if None.
+        """
+        algorithm = algorithm.lower()
+        if algorithm not in ALGORITHM_MAP:
+            raise ValueError(
+                f"Unknown algorithm '{algorithm}'. "
+                f"Supported: {list(ALGORITHM_MAP.keys())}"
+            )
+        self.algorithm = algorithm
+        self.config = config or TrainingConfig()
+        self.model: Optional[object] = None
+        self.train_env: Optional[VecEnv] = None
+        self.eval_env: Optional[VecEnv] = None
+
+    def _make_env(self):
+        """Create a single environment instance."""
+        df = generate_dummy_data(num_days=self.config.num_days)
+        return FinancialAssistantEnv(
+            df=df,
+            initial_balance=self.config.initial_balance,
+            window_size=self.config.window_size,
+            include_macro=self.config.include_macro,
+            include_news=self.config.include_news,
+        )
+
+    def _make_vec_env(self, n_envs: int = None) -> VecEnv:
+        """Create a vectorized environment."""
+        n = n_envs or self.config.num_envs
+        return make_vec_env(self._make_env, n_envs=n)
+
+    def _build_model_kwargs(self) -> dict:
+        """Build algorithm-specific keyword arguments."""
+        kwargs = {
+            "policy": MLP_POLICY,
+            "env": self.train_env,
+            "verbose": self.config.verbose,
+            "learning_rate": self.config.learning_rate,
+            "seed": self.config.seed,
+            "device": self.config.device,
+        }
+
+        # TensorBoard logging
+        tb_log = self.config.get_tensorboard_log(self.algorithm)
+        if tb_log:
+            kwargs["tensorboard_log"] = tb_log
+
+        # Network architecture
+        if self.config.net_arch:
+            kwargs["policy_kwargs"] = {"net_arch": self.config.net_arch}
+
+        # Algorithm-specific params
+        if self.algorithm == "ppo":
+            kwargs.update({
+                "n_steps": self.config.n_steps,
+                "clip_range": self.config.ppo_clip_range,
+                "n_epochs": self.config.ppo_n_epochs,
+                "ent_coef": self.config.ppo_ent_coef,
+                "gamma": self.config.gamma,
+                "gae_lambda": self.config.gae_lambda,
+                "batch_size": self.config.batch_size,
+            })
+        elif self.algorithm == "sac":
+            kwargs.update({
+                "buffer_size": self.config.sac_buffer_size,
+                "learning_starts": self.config.sac_learning_starts,
+                "tau": self.config.sac_tau,
+                "gamma": self.config.gamma,
+                "batch_size": self.config.batch_size,
+            })
+        elif self.algorithm == "a2c":
+            kwargs.update({
+                "n_steps": self.config.n_steps,
+                "gamma": self.config.gamma,
+                "gae_lambda": self.config.gae_lambda,
+            })
+        elif self.algorithm in ("td3", "ddpg"):
+            kwargs.update({
+                "buffer_size": self.config.sac_buffer_size,
+                "learning_starts": self.config.sac_learning_starts,
+                "tau": self.config.sac_tau,
+                "gamma": self.config.gamma,
+                "batch_size": self.config.batch_size,
+            })
+
+        return kwargs
+
+    def _build_callbacks(self) -> list:
+        """Build training callbacks."""
+        callbacks = []
+
+        # Evaluation callback
+        if self.eval_env is not None:
+            callback_list = []
+            if self.config.eval_reward_threshold is not None:
+                callback_list.append(
+                    StopTrainingOnRewardThreshold(
+                        reward_threshold=self.config.eval_reward_threshold,
+                        verbose=self.config.verbose,
+                    )
+                )
+            eval_callback = EvalCallback(
+                self.eval_env,
+                best_model_save_path=f"{self.config.log_dir}/best_model",
+                log_path=f"{self.config.log_dir}/",
+                eval_freq=max(self.config.eval_freq // self.config.num_envs, 1),
+                n_eval_episodes=self.config.n_eval_episodes,
+                callback_on_new_best=callback_list[0] if callback_list else None,
+                verbose=self.config.verbose,
+            )
+            callbacks.append(eval_callback)
+
+        # Logging callback
+        callbacks.append(LoggingCallback())
+
+        return callbacks
+
+    def train(self) -> dict:
+        """
+        Train the model.
+
+        Returns:
+            dict with training stats: algorithm, total_timesteps, save_path
+        """
+        # Create environments
+        self.train_env = self._make_vec_env()
+        self.eval_env = self._make_vec_env(n_envs=1)
+
+        # Build model
+        algo_class = ALGORITHM_MAP[self.algorithm]
+        kwargs = self._build_model_kwargs()
+        self.model = algo_class(**kwargs)
+
+        # Build callbacks
+        callbacks = self._build_callbacks()
+
+        # Train
+        self.model.learn(
+            total_timesteps=self.config.total_timesteps,
+            callback=CallbackList(callbacks) if callbacks else None,
+        )
+
+        # Save
+        save_path = self.config.get_save_path(self.algorithm)
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        self.model.save(save_path)
+
+        if self.config.verbose >= 1:
+            print(f"[{self.algorithm.upper()}] Model saved to {save_path}.zip")
+
+        return {
+            "algorithm": self.algorithm,
+            "total_timesteps": self.config.total_timesteps,
+            "save_path": save_path,
+        }
+
+    def evaluate(self, n_episodes: int = 10, deterministic: bool = True) -> dict:
+        """
+        Evaluate the trained model.
+
+        Args:
+            n_episodes: Number of evaluation episodes
+            deterministic: Use deterministic actions
+
+        Returns:
+            dict with evaluation metrics
+        """
+        if self.model is None:
+            raise RuntimeError("Model not trained yet. Call train() first.")
+
+        env = self._make_env()
+        all_rewards = []
+        all_net_worths = []
+        all_returns = []
+        all_drawdowns = []
+        all_sharpes = []
+
+        for ep in range(n_episodes):
+            obs, info = env.reset(seed=self.config.seed + ep)
+            done = False
+            total_reward = 0.0
+            net_worth_history = [self.config.initial_balance]
+            returns_history = []
+
+            while not done:
+                action, _ = self.model.predict(obs, deterministic=deterministic)
+                obs, reward, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
+                total_reward += reward
+
+                nw = info.get("net_worth", self.config.initial_balance)
+                net_worth_history.append(nw)
+                if len(net_worth_history) >= 2 and net_worth_history[-2] > 0:
+                    returns_history.append(
+                        (net_worth_history[-1] - net_worth_history[-2])
+                        / net_worth_history[-2]
+                    )
+
+            all_rewards.append(total_reward)
+            all_net_worths.append(net_worth_history[-1])
+
+            # Compute metrics
+            from utils.metrics import (
+                calculate_cumulative_return,
+                calculate_max_drawdown,
+                calculate_sharpe_ratio,
+            )
+
+            all_returns.append(calculate_cumulative_return(net_worth_history))
+            all_drawdowns.append(calculate_max_drawdown(net_worth_history))
+            all_sharpes.append(calculate_sharpe_ratio(returns_history))
+
+        results = {
+            "algorithm": self.algorithm,
+            "n_episodes": n_episodes,
+            "mean_reward": sum(all_rewards) / n_episodes,
+            "mean_net_worth": sum(all_net_worths) / n_episodes,
+            "mean_return": sum(all_returns) / n_episodes,
+            "mean_drawdown": sum(all_drawdowns) / n_episodes,
+            "mean_sharpe": sum(all_sharpes) / n_episodes,
+        }
+
+        if self.config.verbose >= 1:
+            print(f"\n--- {self.algorithm.upper()} Evaluation ({n_episodes} episodes) ---")
+            print(f"  Mean Reward:      {results['mean_reward']:.4f}")
+            print(f"  Mean Net Worth:   {results['mean_net_worth']:.2f}")
+            print(f"  Mean Return:      {results['mean_return']:.4f}")
+            print(f"  Mean Max DD:      {results['mean_drawdown']:.4f}")
+            print(f"  Mean Sharpe:      {results['mean_sharpe']:.4f}")
+
+        return results
+
+    def load(self, path: str):
+        """Load a saved model."""
+        algo_class = ALGORITHM_MAP[self.algorithm]
+        self.model = algo_class.load(path)
+
+    def close(self):
+        """Close environments."""
+        if self.train_env is not None:
+            self.train_env.close()
+        if self.eval_env is not None:
+            self.eval_env.close()

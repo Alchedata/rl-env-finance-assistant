@@ -1,0 +1,383 @@
+"""
+GRPO Trainer — Group Relative Policy Optimization for continuous action spaces.
+
+Implements GRPO (inspired by DeepSeek-Math, 2024) adapted for RL:
+
+1. For each observation, sample a group of G actions from the current policy
+2. Execute each action in the environment to get rewards
+3. Compute group-relative advantages: A_i = (R_i - mean(R)) / std(R)
+4. Update policy using clipped PPO-style objective with group advantages
+
+This avoids the need for a separate value function (critic), making it
+simpler and more stable than actor-critic methods for financial environments.
+"""
+import os
+import copy
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from typing import Optional
+
+from env.financial_env import FinancialAssistantEnv, generate_dummy_data
+from training.config import TrainingConfig
+
+
+class GRPOPolicy(nn.Module):
+    """
+    Policy network for GRPO with Gaussian action distribution.
+
+    Unlike actor-critic methods, GRPO does not need a value head since
+    advantages are computed from group reward statistics.
+    """
+
+    def __init__(self, obs_dim: int, act_dim: int, hidden_sizes: list = None):
+        super().__init__()
+        hidden_sizes = hidden_sizes or [256, 256]
+
+        layers = []
+        in_dim = obs_dim
+        for h in hidden_sizes:
+            layers.extend([nn.Linear(in_dim, h), nn.ReLU()])
+            in_dim = h
+
+        self.backbone = nn.Sequential(*layers)
+        self.mean_head = nn.Linear(in_dim, act_dim)
+        self.log_std_head = nn.Parameter(torch.zeros(act_dim))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                nn.init.zeros_(m.bias)
+        nn.init.orthogonal_(self.mean_head.weight, gain=0.01)
+
+    def forward(self, obs: torch.Tensor):
+        """Returns mean (batch, act_dim) and std (batch, act_dim)."""
+        features = self.backbone(obs)
+        mean = torch.sigmoid(self.mean_head(features))
+        std = torch.exp(self.log_std_head).expand_as(mean)
+        return mean, std
+
+    def sample(self, obs: torch.Tensor, n_samples: int = 1) -> tuple:
+        """
+        Sample actions from the policy.
+
+        Returns:
+            actions: (batch, n_samples, act_dim)
+            log_probs: (batch, n_samples)
+        """
+        mean, std = self.forward(obs)
+        mean_exp = mean.unsqueeze(1).expand(-1, n_samples, -1)
+        std_exp = std.unsqueeze(1).expand(-1, n_samples, -1)
+
+        dist = torch.distributions.Normal(mean_exp, std_exp)
+        actions = dist.sample()
+        log_probs = dist.log_prob(actions).sum(dim=-1)
+
+        return actions, log_probs
+
+    def log_prob(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        """Compute log probability of actions. Returns (batch,)."""
+        mean, std = self.forward(obs)
+        dist = torch.distributions.Normal(mean, std)
+        return dist.log_prob(actions).sum(dim=-1)
+
+    def get_action(self, obs: np.ndarray, deterministic: bool = False) -> np.ndarray:
+        """Get action for a single observation."""
+        with torch.no_grad():
+            obs_t = torch.FloatTensor(obs).unsqueeze(0)
+            mean, std = self.forward(obs_t)
+            if deterministic:
+                return mean.squeeze(0).numpy()
+            dist = torch.distributions.Normal(mean, std)
+            return dist.sample().squeeze(0).numpy()
+
+
+class GRPOTrainer:
+    """
+    Group Relative Policy Optimization trainer.
+
+    GRPO eliminates the need for a value function by computing advantages
+    relative to a group of samples. For each state, sample G actions,
+    evaluate them, and use the group statistics for advantage estimation.
+
+    Usage:
+        trainer = GRPOTrainer(config)
+        trainer.train()
+        trainer.evaluate()
+    """
+
+    def __init__(self, config: TrainingConfig = None):
+        self.config = config or TrainingConfig()
+        self.device = torch.device(
+            "cuda" if torch.cuda.is_available() and self.config.device != "cpu"
+            else "cpu"
+        )
+        self.policy: Optional[GRPOPolicy] = None
+        self.reference_policy: Optional[GRPOPolicy] = None
+        self.env: Optional[FinancialAssistantEnv] = None
+
+    def _make_env(self) -> FinancialAssistantEnv:
+        """Create environment."""
+        return FinancialAssistantEnv(
+            df=generate_dummy_data(num_days=self.config.num_days),
+            initial_balance=self.config.initial_balance,
+            window_size=self.config.window_size,
+            include_macro=self.config.include_macro,
+            include_news=self.config.include_news,
+        )
+
+    def _init_policy(self, obs_dim: int, act_dim: int):
+        """Initialize policy and reference policy."""
+        self.policy = GRPOPolicy(obs_dim, act_dim).to(self.device)
+        self.reference_policy = GRPOPolicy(obs_dim, act_dim).to(self.device)
+        self.reference_policy.load_state_dict(copy.deepcopy(self.policy.state_dict()))
+        self.reference_policy.eval()
+
+    def _evaluate_actions_in_env(
+        self, env: FinancialAssistantEnv, obs: np.ndarray, actions: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Evaluate a group of actions for a single observation.
+
+        Uses single-step reward as the action value (approximation).
+        """
+        rewards = np.zeros(len(actions))
+        for i, action in enumerate(actions):
+            action_clipped = np.clip(action, 0, 1)
+            _, reward, _, _, _ = env.step(action_clipped)
+            rewards[i] = reward
+        return rewards
+
+    def _collect_group_data(self, env: FinancialAssistantEnv, n_steps: int = 500) -> dict:
+        """
+        Collect group data by running the environment and sampling action groups.
+        """
+        G = self.config.grpo_group_size
+        all_observations = []
+        all_actions = []
+        all_rewards = []
+        all_group_ids = []
+        all_old_log_probs = []
+
+        obs, info = env.reset(seed=self.config.seed)
+        group_id = 0
+
+        for step in range(n_steps):
+            obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+
+            with torch.no_grad():
+                actions, log_probs = self.policy.sample(obs_tensor, n_samples=G)
+                actions_np = actions.squeeze(0).cpu().numpy()
+                log_probs_np = log_probs.squeeze(0).cpu().numpy()
+
+            rewards = self._evaluate_actions_in_env(env, obs, actions_np)
+
+            for g in range(G):
+                all_observations.append(obs.copy())
+                all_actions.append(actions_np[g])
+                all_rewards.append(rewards[g])
+                all_group_ids.append(group_id)
+                all_old_log_probs.append(log_probs_np[g])
+
+            group_id += 1
+
+            best_idx = np.argmax(rewards)
+            obs, _, _, _, info = env.step(actions_np[best_idx])
+
+            if info.get("score_report"):
+                obs, info = env.reset()
+
+        return {
+            "observations": np.array(all_observations),
+            "actions": np.array(all_actions),
+            "rewards": np.array(all_rewards),
+            "group_ids": np.array(all_group_ids),
+            "old_log_probs": np.array(all_old_log_probs),
+        }
+
+    def _compute_group_advantages(self, rewards: np.ndarray, group_ids: np.ndarray) -> np.ndarray:
+        """
+        Compute group-relative advantages.
+
+        For each group: advantage = (reward - group_mean) / (group_std + eps)
+        """
+        advantages = np.zeros_like(rewards)
+        unique_groups = np.unique(group_ids)
+
+        for gid in unique_groups:
+            mask = group_ids == gid
+            group_rewards = rewards[mask]
+            mean_r = group_rewards.mean()
+            std_r = group_rewards.std()
+            advantages[mask] = (group_rewards - mean_r) / (std_r + 1e-8)
+
+        return advantages
+
+    def train(self, n_iterations: int = 10, steps_per_iter: int = 500) -> dict:
+        """
+        Train the policy using GRPO.
+
+        Args:
+            n_iterations: Number of training iterations
+            steps_per_iter: Steps of data collection per iteration
+
+        Returns:
+            dict with training stats
+        """
+        env = self._make_env()
+        self.env = env
+        obs_dim = env.observation_space.shape[0]
+        act_dim = env.action_space.shape[0]
+
+        if self.policy is None:
+            self._init_policy(obs_dim, act_dim)
+
+        optimizer = optim.Adam(self.policy.parameters(), lr=self.config.learning_rate)
+        clip_range = self.config.grpo_clip_range
+        n_epochs = self.config.grpo_n_epochs
+
+        all_metrics = []
+
+        for iteration in range(n_iterations):
+            data = self._collect_group_data(env, n_steps=steps_per_iter)
+            advantages = self._compute_group_advantages(data["rewards"], data["group_ids"])
+
+            obs_t = torch.FloatTensor(data["observations"]).to(self.device)
+            act_t = torch.FloatTensor(data["actions"]).to(self.device)
+            adv_t = torch.FloatTensor(advantages).to(self.device)
+            old_log_prob_t = torch.FloatTensor(data["old_log_probs"]).to(self.device)
+
+            with torch.no_grad():
+                ref_log_prob = self.reference_policy.log_prob(obs_t, act_t)
+
+            iter_losses = []
+            for epoch in range(n_epochs):
+                new_log_prob = self.policy.log_prob(obs_t, act_t)
+                log_ratio = new_log_prob - old_log_prob_t
+                ratio = torch.exp(log_ratio)
+
+                surr1 = ratio * adv_t
+                surr2 = torch.clamp(ratio, 1 - clip_range, 1 + clip_range) * adv_t
+                policy_loss = -torch.min(surr1, surr2).mean()
+
+                kl_penalty = (new_log_prob - ref_log_prob).mean()
+                loss = policy_loss + 0.01 * kl_penalty
+
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+                optimizer.step()
+
+                iter_losses.append(loss.item())
+
+            if (iteration + 1) % max(1, n_iterations // 5) == 0:
+                self.reference_policy.load_state_dict(
+                    copy.deepcopy(self.policy.state_dict())
+                )
+
+            avg_loss = np.mean(iter_losses)
+            mean_reward = data["rewards"].mean()
+            mean_adv = advantages.mean()
+
+            all_metrics.append({
+                "iteration": iteration,
+                "loss": avg_loss,
+                "mean_reward": mean_reward,
+                "mean_advantage": mean_adv,
+            })
+
+            if self.config.verbose >= 1:
+                print(
+                    f"[GRPO] Iter {iteration + 1}/{n_iterations} | "
+                    f"Loss: {avg_loss:.6f} | "
+                    f"Mean Reward: {mean_reward:.4f} | "
+                    f"Mean Adv: {mean_adv:.4f}"
+                )
+
+        save_path = self.config.get_save_path("grpo")
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        torch.save(self.policy.state_dict(), f"{save_path}.pt")
+        print(f"[GRPO] Policy saved to {save_path}.pt")
+
+        return {
+            "algorithm": "grpo",
+            "n_iterations": n_iterations,
+            "final_loss": all_metrics[-1]["loss"],
+            "metrics_history": all_metrics,
+            "save_path": save_path,
+        }
+
+    def evaluate(self, n_episodes: int = 10, deterministic: bool = True) -> dict:
+        """Evaluate the trained GRPO policy."""
+        if self.policy is None:
+            raise RuntimeError("Policy not trained yet.")
+
+        env = self.env or self._make_env()
+        all_rewards = []
+        all_net_worths = []
+        all_returns = []
+        all_drawdowns = []
+        all_sharpes = []
+
+        for ep in range(n_episodes):
+            obs, info = env.reset(seed=self.config.seed + ep)
+            done = False
+            total_reward = 0.0
+            net_worth_history = [self.config.initial_balance]
+            returns_history = []
+
+            while not done:
+                action = self.policy.get_action(obs, deterministic=deterministic)
+                obs, reward, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
+                total_reward += reward
+
+                nw = info.get("net_worth", self.config.initial_balance)
+                net_worth_history.append(nw)
+                if len(net_worth_history) >= 2 and net_worth_history[-2] > 0:
+                    returns_history.append(
+                        (net_worth_history[-1] - net_worth_history[-2])
+                        / net_worth_history[-2]
+                    )
+
+            all_rewards.append(total_reward)
+            all_net_worths.append(net_worth_history[-1])
+
+            from utils.metrics import (
+                calculate_cumulative_return,
+                calculate_max_drawdown,
+                calculate_sharpe_ratio,
+            )
+            all_returns.append(calculate_cumulative_return(net_worth_history))
+            all_drawdowns.append(calculate_max_drawdown(net_worth_history))
+            all_sharpes.append(calculate_sharpe_ratio(returns_history))
+
+        results = {
+            "algorithm": "grpo",
+            "n_episodes": n_episodes,
+            "mean_reward": sum(all_rewards) / n_episodes,
+            "mean_net_worth": sum(all_net_worths) / n_episodes,
+            "mean_return": sum(all_returns) / n_episodes,
+            "mean_drawdown": sum(all_drawdowns) / n_episodes,
+            "mean_sharpe": sum(all_sharpes) / n_episodes,
+        }
+
+        if self.config.verbose >= 1:
+            print(f"\n--- GRPO Evaluation ({n_episodes} episodes) ---")
+            print(f"  Mean Reward:      {results['mean_reward']:.4f}")
+            print(f"  Mean Net Worth:   {results['mean_net_worth']:.2f}")
+            print(f"  Mean Return:      {results['mean_return']:.4f}")
+            print(f"  Mean Max DD:      {results['mean_drawdown']:.4f}")
+            print(f"  Mean Sharpe:      {results['mean_sharpe']:.4f}")
+
+        return results
+
+    def load(self, path: str):
+        """Load a saved policy."""
+        if self.policy is None:
+            raise RuntimeError("Initialize policy first.")
+        self.policy.load_state_dict(torch.load(path, map_location=self.device))

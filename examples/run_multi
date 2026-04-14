@@ -1,0 +1,101 @@
+"""
+Multi-Algorithm Training Example — demonstrates PPO, SAC, DPO, and GRPO training.
+"""
+from training.config import TrainingConfig
+from training.sb3_trainer import SB3Trainer
+from training.dpo_trainer import DPOTrainer
+from training.grpo_trainer import GRPOTrainer
+
+
+def train_sb3_algorithms():
+    """Train with Stable-Baselines3 algorithms: PPO, SAC, A2C."""
+    print("=" * 70)
+    print("SB3 Algorithm Training (PPO, SAC, A2C)")
+    print("=" * 70)
+
+    config = TrainingConfig(
+        total_timesteps=10_000,
+        verbose=1,
+        log_dir="./logs",
+    )
+
+    for algo in ["ppo", "sac", "a2c"]:
+        print(f"\n--- Training {algo.upper()} ---")
+        trainer = SB3Trainer(algo, config)
+        trainer.train()
+        trainer.evaluate(n_episodes=3)
+        trainer.close()
+        print()
+
+
+def train_dpo():
+    """Train with Direct Preference Optimization."""
+    print("=" * 70)
+    print("DPO Training")
+    print("=" * 70)
+
+    config = TrainingConfig(
+        total_timesteps=5_000,
+        dpo_beta=0.1,
+        dpo_n_epochs=5,
+        batch_size=32,
+        verbose=1,
+        log_dir="./logs",
+    )
+
+    trainer = DPOTrainer(config)
+
+    # Collect preferences using random policies
+    print("\n--- Collecting preference data ---")
+    trainer.collect_preferences(n_episodes=10)
+
+    # Train with DPO
+    print("\n--- Training DPO policy ---")
+    trainer.train()
+
+    # Evaluate
+    trainer.evaluate(n_episodes=3)
+    print()
+
+
+def train_grpo():
+    """Train with Group Relative Policy Optimization."""
+    print("=" * 70)
+    print("GRPO Training")
+    print("=" * 70)
+
+    config = TrainingConfig(
+        grpo_group_size=4,
+        grpo_clip_range=0.2,
+        grpo_n_epochs=2,
+        learning_rate=3e-4,
+        verbose=1,
+        log_dir="./logs",
+    )
+
+    trainer = GRPOTrainer(config)
+
+    # Train with GRPO
+    print("\n--- Training GRPO policy ---")
+    trainer.train(n_iterations=5, steps_per_iter=100)
+
+    # Evaluate
+    trainer.evaluate(n_episodes=3)
+    print()
+
+
+if __name__ == "__main__":
+    print("Financial Assistant RL Environment — Multi-Algorithm Training Demo\n")
+
+    # 1. SB3 algorithms
+    train_sb3_algorithms()
+
+    # 2. DPO
+    train_dpo()
+
+    # 3. GRPO
+    train_grpo()
+
+    print("\n" + "=" * 70)
+    print("All training demos completed!")
+    print("=" * 70)
