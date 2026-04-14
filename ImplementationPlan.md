@@ -1,0 +1,410 @@
+# Implementation Plan
+
+## Financial Assistant RL Environment
+
+A Gymnasium-compatible reinforcement learning environment for training financial assistant agents across stock analysis, portfolio management, and financial planning tasks.
+
+---
+
+## 1. Project Overview
+
+**Mission:** Provide a modular, extensible RL environment where agents learn to make financial decisions under varying market conditions, difficulty levels, and information regimes.
+
+**Design Principles:**
+
+- **Gymnasium-first** — Standard `reset()` / `step()` API; compatible with Stable-Baselines3, CleanRL, and custom trainers
+- **Task-driven** — Each episode is a procedurally generated task with market type, difficulty, and risk profile
+- **Curriculum-aware** — Built-in `CurriculumScheduler` adjusts difficulty based on agent performance
+- **Information-tiered** — Optional macro and news features let researchers study the value of alternative data
+- **Deterministic when seeded** — Reproducible episodes for debugging and benchmarking
+
+---
+
+## 2. Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    FinancialAssistantEnv                     │
+│                                                             │
+│  ┌──────────────┐  ┌──────────────────┐  ┌───────────────┐  │
+│  │ TaskGenerator│──▶│  TradingSimulator│──▶│RewardCalculator│ │
+│  │              │  │                  │  │               │  │
+│  │ • market type│  │ • cash + shares  │  │ • return      │  │
+│  │ • difficulty │  │ • rebalance()    │  │ • drawdown    │  │
+│  │ • risk prof  │  │ • commission     │  │ • transaction │  │
+│  └──────────────┘  │ • slippage       │  │ • volatility  │  │
+│        │           └──────────────────┘  └───────────────┘  │
+│        │                    │                    │          │
+│        ▼                    ▼                    ▼          │
+│  ┌──────────────────┐  ┌──────────────┐  ┌───────────────┐  │
+│  │CurriculumScheduler│  │FeatureEngi-  │  │ EpisodeScorer │  │
+│  │                  │  │neering       │  │               │  │
+│  │ • promote/demote │  │ • technical  │  │ • final score │  │
+│  │ • difficulty     │  │ • macro      │  │ • difficulty  │  │
+│  │   adjustment    │  │ • news       │  │   bonus       │  │
+│  └──────────────────┘  └──────────────┘  └───────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Data flow per step:**
+
+1. `reset()` → `TaskGenerator` produces a task (or single-asset mode uses provided DataFrame)
+2. `FeatureEngineering` precomputes feature DataFrames for all assets
+3. Each `step(action)`:
+   - Softmax-normalize action → portfolio weights
+   - `TradingSimulator.rebalance(weights, prices)` → execute trades, return transaction cost
+   - `RewardCalculator.compute(...)` → scalar reward
+   - `FeatureEngineering` values read from precomputed DataFrame → observation vector
+4. On episode end → `EpisodeScorer.score(...)` → `CurriculumScheduler.record_episode(score)`
+
+---
+
+## 3. Core Components
+
+### 3.1 TradingSimulator (`env/simulator.py`)
+
+Manages portfolio state: cash balance, share holdings, and transaction costs.
+
+| Method | Description |
+|--------|-------------|
+| `reset(initial_balance, asset_names)` | Reset to all-cash portfolio |
+| `rebalance(target_weights, prices)` | Trade toward target weights; return transaction cost |
+| `get_position_ratios(prices)` | Current portfolio allocation as ratios (sums to 1) |
+
+**Transaction model:**
+- Commission: `rate × trade_value` (default 0.1%)
+- Slippage: `rate × trade_value` (default 0.05%)
+- Both configurable per task via `TaskGenerator`
+
+### 3.2 FeatureEngineering (`env/feature_engineering.py`)
+
+Precomputes per-asset feature DataFrames from OHLCV input.
+
+**Technical features (6 per asset):**
+
+| Feature | Formula | Purpose |
+|---------|---------|---------|
+| `log_return` | `ln(close_t / close_{t-1})` | Price momentum |
+| `volatility_5` | 5-day rolling std of returns | Short-term risk |
+| `volatility_20` | 20-day rolling std of returns | Medium-term risk |
+| `sma_ratio` | `close / SMA(20)` | Mean-reversion signal |
+| `rsi_14` | 14-day RSI | Overbought/oversold |
+| `bb_width` | `(upper - lower) / middle` of Bollinger Bands(20) | Volatility regime |
+
+**Optional features (3 each):**
+
+| Category | Features |
+|----------|----------|
+| Macro | `interest_rate_change`, `cpi_growth`, `unemployment_change` |
+| News | `sentiment_score`, `news_volume`, `sentiment_momentum` |
+
+When enabled, macro/news data is generated by `TaskGenerator` and merged into the feature DataFrame.
+
+### 3.3 RewardCalculator (`env/reward.py`)
+
+Computes a single scalar reward per step combining multiple signals:
+
+```
+reward = w_return × step_return
+       − w_vol × volatility_penalty
+       − w_cost × transaction_cost_penalty
+       − w_dd × drawdown_penalty
+```
+
+| Component | Default Weight | Formula | Rationale |
+|-----------|---------------|---------|-----------|
+| Step return | 1.0 | `(curr − prev) / prev` | Primary signal — reward positive returns |
+| Volatility penalty | 0.1 | `std(last 20 returns)` | Penalize instability |
+| Transaction cost penalty | 0.5 | `transaction_cost / prev_net_worth` | Discourage excessive trading |
+| Drawdown penalty | 0.2 | `max(0, (peak − curr) / peak)` | Penalize drawdowns from peak |
+
+All weights are configurable. The reward is designed to be **dense enough** for learning while **aligned with long-term performance**.
+
+### 3.4 EpisodeScorer (`env/scorer.py`)
+
+Produces a comprehensive score report at episode end, used by `CurriculumScheduler`.
+
+**Score formula:**
+
+```
+base_score = 50
+           + 30 × clamp(total_return, −1, 1)    # return contribution (±30)
+           + 20 × clamp(sharpe/3, −1, 1)         # risk-adjusted contribution (±20)
+           − 15 × max_drawdown                    # drawdown penalty (up to −15)
+
+base_score = clamp(base_score, 0, 100)
+final_score = clamp(base_score × difficulty_multiplier, 0, 100)
+```
+
+The difficulty multiplier (`1.0 + difficulty × 0.5`, range 1.0–1.5) rewards agents that perform well on harder tasks.
+
+### 3.5 TaskGenerator (`env/task_generator.py`)
+
+Procedurally generates episodes with controlled difficulty.
+
+**Task structure:**
+
+```python
+{
+    'data_dict': {asset_name: DataFrame, ...},  # OHLCV per asset
+    'meta': {
+        'task_type': str,           # stock_analysis | portfolio_management | financial_planning
+        'market_type': str,         # bull | bear | sideways | volatile | crisis
+        'difficulty': str,          # beginner | easy | medium | hard | expert
+        'difficulty_score': float,  # 0.0 – 1.0
+        'window_size': int,
+        'has_macro_data': bool,
+        'has_news_data': bool,
+        'risk_profile': str,       # conservative | moderate | aggressive
+    },
+    'initial_balance': float,
+    'commission_rate': float,
+    'slippage_rate': float,
+    'macro_data': DataFrame | None,
+    'news_data': DataFrame | None,
+}
+```
+
+**Difficulty scaling (0.0 → 1.0):**
+
+| Parameter | Low Difficulty | High Difficulty |
+|-----------|---------------|----------------|
+| Window size | 300 (more data) | 100 (less data) |
+| Commission | 0.05% | 0.5% |
+| Slippage | 0.02% | 0.2% |
+| Market type | bull/sideways | crisis/volatile |
+| Assets | 1 | 3 |
+
+**Market simulation:** Prices follow Geometric Brownian Motion with regime-dependent drift and volatility parameters.
+
+### 3.6 CurriculumScheduler (`env/curriculum_scheduler.py`)
+
+Adjusts task difficulty across episodes based on agent performance.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `initial_difficulty` | 0.1 | Starting difficulty (0.0–1.0) |
+| `promotion_threshold` | 50.0 | Score to increase difficulty |
+| `demotion_threshold` | 10.0 | Score to decrease difficulty |
+| `adjustment_rate` | 0.1 | Step size for difficulty changes |
+| `window_size` | 5 | Rolling window for average score |
+
+**Logic:**
+- If rolling avg score ≥ promotion threshold → increase difficulty
+- If rolling avg score ≤ demotion threshold → decrease difficulty
+- Difficulty clamped to [0.0, 1.0]
+
+---
+
+## 4. Observation, Action & Reward Spaces
+
+### Observation Space
+
+```
+Box(low=-inf, high=inf, shape=(window_size × n_features,), dtype=float32)
+```
+
+Where `n_features` = technical + portfolio + progress + macro + news:
+
+| Component | Dimensions | Description |
+|-----------|-----------|-------------|
+| Technical | `max_assets × 6` | Per-asset: log_return, vol_5, vol_20, sma_ratio, rsi_14, bb_width |
+| Portfolio | `max_assets + 1` | Position ratios: [cash, asset_0, asset_1, ...] |
+| Progress | 1 | `current_step / total_steps` |
+| Macro | 0 or 3 | interest_rate_change, cpi_growth, unemployment_change |
+| News | 0 or 3 | sentiment_score, news_volume, sentiment_momentum |
+
+The observation is a **sliding window** of the last `window_size` feature vectors, flattened.
+
+### Action Space
+
+```
+Box(low=0, high=1, shape=(max_assets + 1,), dtype=float32)
+```
+
+Raw actions are **softmax-normalized** to produce valid portfolio weights summing to 1. Index 0 = cash allocation.
+
+### Reward
+
+Scalar float per step (see §3.3). Negative rewards penalize losses, drawdowns, and excessive trading.
+
+---
+
+## 5. Task Types
+
+| Task Type | Assets | Typical Window | Focus |
+|-----------|--------|---------------|-------|
+| `stock_analysis` | 1 | 200–300 | Single-stock directional trading |
+| `portfolio_management` | 2–3 | 150–250 | Multi-asset allocation |
+| `financial_planning` | 1–2 | 100–200 | Long-horizon conservative growth |
+
+Each task type produces different market regimes, difficulty parameters, and risk profiles via `TaskGenerator`.
+
+---
+
+## 6. Usage
+
+### Quick Start (Single Asset)
+
+```python
+from env.financial_env import FinancialAssistantEnv, generate_dummy_data
+
+df = generate_dummy_data(num_days=1000)
+env = FinancialAssistantEnv(df=df, window_size=20)
+
+obs, info = env.reset(seed=42)
+action = env.action_space.sample()
+obs, reward, terminated, truncated, info = env.step(action)
+```
+
+### Multi-Asset with Curriculum
+
+```python
+from env import FinancialAssistantEnv, TaskGenerator, CurriculumScheduler
+from env.task_generator import create_multi_asset_data, create_simulated_macro_data, create_simulated_news_data
+
+# Generate simulated data
+data_dict = create_multi_asset_data(num_assets=3, days=1000)
+macro_data = create_simulated_macro_data(days=1000)
+news_data = create_simulated_news_data(days=1000)
+
+task_gen = TaskGenerator(
+    data_dict=data_dict,
+    macro_data=macro_data,
+    news_data=news_data,
+    risk_profiles=['conservative', 'moderate', 'aggressive'],
+)
+curriculum = CurriculumScheduler(initial_difficulty=0.1)
+
+env = FinancialAssistantEnv(
+    task_generator=task_gen,
+    curriculum_scheduler=curriculum,
+    include_macro=True,
+    include_news=True,
+    window_size=20,
+)
+
+obs, info = env.reset()
+# ... training loop ...
+# Curriculum automatically adjusts difficulty based on episode scores
+```
+
+### Training with Stable-Baselines3
+
+```python
+from stable_baselines3 import PPO
+from env.financial_env import FinancialAssistantEnv, generate_dummy_data
+
+df = generate_dummy_data()
+env = FinancialAssistantEnv(df=df)
+
+model = PPO("MlpPolicy", env, verbose=1)
+model.learn(total_timesteps=100_000)
+```
+
+---
+
+## 7. File Structure
+
+```
+rl-env-finance-assistant/
+├── ImplementationPlan.md          # This document
+├── README.md
+├── requirements.txt
+├── LICENSE
+├── env/
+│   ├── __init__.py                # Public API exports
+│   ├── financial_env.py           # FinancialAssistantEnv (Gymnasium env)
+│   ├── simulator.py               # TradingSimulator (portfolio + execution)
+│   ├── feature_engineering.py     # FeatureEngineering (technical + macro + news)
+│   ├── reward.py                  # RewardCalculator (step reward)
+│   ├── scorer.py                  # EpisodeScorer (episode score report)
+│   ├── task_generator.py          # TaskGenerator (procedural task generation)
+│   └── curriculum_scheduler.py    # CurriculumScheduler (difficulty adjustment)
+├── utils/
+│   └── metrics.py                 # Performance metrics utilities
+└── examples/
+    ├── run_random_agent.py        # Random agent baseline
+    ├── run_enhanced_demo.py       # Full demo: macro/news + curriculum + difficulty
+    ├── run_task_generator_demo.py # Task generation and scoring demo
+    └── run_training.py            # PPO training example
+```
+
+---
+
+## 8. Implementation Phases
+
+### Phase 1 — Core Environment ✅
+
+**Deliverables:** Simulator, features, reward, scorer
+
+| Component | Status | File |
+|-----------|--------|------|
+| TradingSimulator | ✅ Complete | `env/simulator.py` |
+| FeatureEngineering | ✅ Complete | `env/feature_engineering.py` |
+| RewardCalculator | ✅ Complete | `env/reward.py` |
+| EpisodeScorer | ✅ Complete | `env/scorer.py` |
+
+**Validation:** Single-asset environment runs end-to-end with random actions.
+
+### Phase 2 — Task Generation ✅
+
+**Deliverables:** Procedural task generation with difficulty scaling
+
+| Component | Status | File |
+|-----------|--------|------|
+| TaskGenerator | ✅ Complete | `env/task_generator.py` |
+| Multi-asset data generation | ✅ Complete | `env/task_generator.py` |
+| Macro/news data generation | ✅ Complete | `env/task_generator.py` |
+
+**Validation:** Tasks generated across all market types and difficulty levels.
+
+### Phase 3 — Environment Integration ✅
+
+**Deliverables:** Full Gymnasium environment with curriculum learning
+
+| Component | Status | File |
+|-----------|--------|------|
+| FinancialAssistantEnv | ✅ Complete | `env/financial_env.py` |
+| CurriculumScheduler | ✅ Complete | `env/curriculum_scheduler.py` |
+| Package exports | ✅ Complete | `env/__init__.py` |
+
+**Validation:** All example scripts run successfully; curriculum learning shows difficulty progression.
+
+### Phase 4 — Polish & Extend 🔄
+
+**Planned work:**
+
+- [ ] Comprehensive unit tests (`tests/` directory)
+- [ ] Real market data integration via yfinance
+- [ ] Additional technical indicators (MACD, ATR, OBV)
+- [ ] Action masking for risk-profile constraints
+- [ ] Multi-agent support (competitive portfolio management)
+- [ ] Weights & Biases / TensorBoard logging integration
+- [ ] Performance benchmarks against buy-and-hold baselines
+
+---
+
+## 9. Dependencies
+
+| Package | Version | Purpose |
+|---------|---------|---------|
+| gymnasium | 0.29.1 | Environment API |
+| numpy | 1.26.4 | Numerical computation |
+| pandas | 2.2.1 | Data manipulation |
+| matplotlib | 3.8.3 | Visualization |
+| stable-baselines3 | 2.2.1 | RL algorithms (PPO, A2C, etc.) |
+| scikit-learn | 1.4.1 | Feature preprocessing |
+| yfinance | 0.2.37 | Real market data (optional) |
+
+---
+
+## 10. Risk Assessment
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| Reward hacking (agent finds exploit) | High | Multi-component reward with transaction costs; regular sanity checks against buy-and-hold |
+| Observation space too large | Medium | Window size configurable; feature selection via `include_macro`/`include_news` flags |
+| Simulated markets ≠ real markets | Medium | GBM with regime switching approximates stylized facts; real data integration planned |
+| Curriculum gets stuck | Low | Demotion threshold prevents permanent frustration; rolling window adapts to recent performance |
+| Numerical instability | Low | Softmax normalization, NaN/Inf guards in observation builder, reward clipping |

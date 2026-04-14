@@ -7,7 +7,6 @@ from utils.metrics import calculate_cumulative_return, calculate_max_drawdown, c
 
 def run_random_agent(env, num_episodes=5):
     """
-    运行随机 Agent 示例，演示环境使用。
     Runs a random agent example to demonstrate environment usage.
     """
     print("\n--- Running Random Agent Example ---")
@@ -24,7 +23,7 @@ def run_random_agent(env, num_episodes=5):
 
         print(f"\nEpisode {episode + 1}/{num_episodes}")
         while not done:
-            action = env.action_space.sample() # 随机动作
+            action = env.action_space.sample() # Random action
             prev_net_worth = env.simulator.net_worth
             obs, reward, terminated, truncated, info = env.step(action)
             total_reward += reward
@@ -36,7 +35,7 @@ def run_random_agent(env, num_episodes=5):
             else:
                 episode_returns_history.append(0.0)
 
-            # env.render() # 如果需要可视化，可以取消注释
+            # env.render() # Uncomment to enable rendering
 
             if terminated or truncated:
                 done = True

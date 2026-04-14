@@ -1,6 +1,5 @@
 """
-Enhanced Demo: 展示丰富环境反馈 + 课程学习功能
-Demonstrates rich environment feedback (macro, news) and curriculum learning.
+Enhanced Demo: Demonstrates rich environment feedback + curriculum learning features.
 """
 import sys
 import os
@@ -16,7 +15,7 @@ from env.curriculum_scheduler import CurriculumScheduler
 
 
 def run_single_episode(env, task_type="stock_analysis"):
-    """运行一个 episode 并返回结果"""
+    """Run an episode and return results"""
     obs, info = env.reset(options={"task_type": task_type})
     done = False
     total_reward = 0
@@ -34,17 +33,17 @@ def run_single_episode(env, task_type="stock_analysis"):
 
 
 def demo_rich_feedback():
-    """演示丰富环境反馈（宏观经济 + 新闻情感）"""
+    """Demonstrates rich environment feedback (macro economics + news sentiment)"""
     print("=" * 70)
     print("Demo 1: Rich Environment Feedback (Macro + News)")
     print("=" * 70)
 
-    # 创建模拟数据
+    # Create simulated data
     data_dict = create_multi_asset_data(num_assets=3, days=500)
     macro_data = create_simulated_macro_data(days=500)
     news_data = create_simulated_news_data(days=500)
 
-    # 创建带宏观和新闻数据的任务生成器
+    # Create task generator with macro and news data
     task_gen = TaskGenerator(
         data_dict=data_dict,
         risk_profiles=['conservative', 'moderate', 'aggressive'],
@@ -52,7 +51,7 @@ def demo_rich_feedback():
         news_data=news_data
     )
 
-    # 创建环境（启用宏观和新闻特征）
+    # Create environment (enabling macro and news features)
     env = FinancialAssistantEnv(
         task_generator=task_gen,
         include_macro=True,
@@ -62,7 +61,7 @@ def demo_rich_feedback():
     print(f"\nObservation space: {env.observation_space.shape}")
     print(f"Action space: {env.action_space.shape}")
 
-    # 运行不同类型的任务
+    # Run different types of tasks
     for task_type in ["stock_analysis", "portfolio_management", "financial_planning"]:
         print(f"\n--- Task Type: {task_type} ---")
         total_reward, steps, info = run_single_episode(env, task_type)
@@ -91,12 +90,12 @@ def demo_rich_feedback():
 
 
 def demo_curriculum_learning():
-    """演示课程学习功能"""
+    """Demonstrates curriculum learning functionality"""
     print("=" * 70)
     print("Demo 2: Curriculum Learning")
     print("=" * 70)
 
-    # 创建数据
+    # Create data
     data_dict = create_multi_asset_data(num_assets=3, days=500)
     macro_data = create_simulated_macro_data(days=500)
     news_data = create_simulated_news_data(days=500)
@@ -108,7 +107,7 @@ def demo_curriculum_learning():
         news_data=news_data
     )
 
-    # 创建课程学习调度器
+    # Create curriculum learning scheduler
     scheduler = CurriculumScheduler(
         initial_difficulty=0.1,
         promotion_threshold=50.0,
@@ -119,7 +118,7 @@ def demo_curriculum_learning():
         exploration_rate=0.1
     )
 
-    # 创建带课程学习的环境
+    # Create environment with curriculum learning
     env = FinancialAssistantEnv(
         task_generator=task_gen,
         curriculum_scheduler=scheduler,
@@ -148,52 +147,33 @@ def demo_curriculum_learning():
               f"Demotions: {stats['demotions']} | "
               f"Avg Score: {stats['recent_avg_score']:6.2f}")
 
-    # 打印最终统计
-    final_stats = scheduler.get_stats()
-    print(f"\n--- Curriculum Learning Summary ---")
-    print(f"  Final Difficulty: {final_stats['current_difficulty']:.2f} ({final_stats['difficulty_label']})")
-    print(f"  Total Episodes: {final_stats['total_episodes']}")
-    print(f"  Total Promotions: {final_stats['promotions']}")
-    print(f"  Total Demotions: {final_stats['demotions']}")
-    print(f"  Recent Avg Score: {final_stats['recent_avg_score']:.2f}")
-
-    # 展示难度参数推荐
-    print(f"\n--- Recommended Task Params at Current Difficulty ---")
-    params = scheduler.get_task_params_for_difficulty()
-    for key, value in params.items():
-        print(f"  {key}: {value}")
-
     env.close()
     print("\nDemo 2 Complete!\n")
 
 
-def demo_difficulty_levels():
-    """演示不同难度等级的任务生成"""
+def demo_difficulty_task_generation():
+    """Demonstrates difficulty-aware task parameters generation"""
     print("=" * 70)
-    print("Demo 3: Difficulty-Aware Task Generation")
+    print("Demo 3: Difficulty-Aware Task Parameters Generation")
     print("=" * 70)
 
-    data_dict = create_multi_asset_data(num_assets=3, days=500)
+    data_dict = create_multi_asset_data(num_assets=3, days=1000)
     task_gen = TaskGenerator(data_dict=data_dict)
 
-    difficulties = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    difficulties = [0.1, 0.4, 0.7, 0.95]
+    
+    print(f"{'Difficulty':<12} | {'Market Type':<12} | {'Slippage':<10} | {'Commission':<10} | {'Window':<8}")
+    print("-" * 70)
 
     for diff in difficulties:
-        task = task_gen.generate_task(task_type="stock_analysis", target_difficulty=diff)
-        meta = task["meta"]
-        print(f"\nTarget Difficulty: {diff:.1f}")
-        print(f"  Market Type: {meta['market_type']}")
-        print(f"  Window Size: {meta['window_size']}")
-        print(f"  Difficulty Score: {meta['difficulty_score']}")
-        print(f"  Commission Rate: {task['commission_rate']:.4f}")
-        print(f"  Slippage Rate: {task['slippage_rate']:.5f}")
-        print(f"  Initial Balance: {task['initial_balance']:.2f}")
+        task = task_gen.generate_task(target_difficulty=diff)
+        meta = task['meta']
+        print(f"{diff:<12.2f} | {meta['market_type']:<12} | {task['slippage_rate']:<10.4f} | {task['commission_rate']:<10.4f} | {meta['window_size']:<8}")
 
     print("\nDemo 3 Complete!\n")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     demo_rich_feedback()
     demo_curriculum_learning()
-    demo_difficulty_levels()
-    print("All demos completed successfully!")
+    demo_difficulty_task_generation()

@@ -1,71 +1,138 @@
-# 金融助手 Agent 强化学习环境 (Financial Assistant Agent RL Environment)
+# Financial Assistant Agent RL Environment
 
-## 1. 项目简介
+## 1. Project Overview
 
-本项目旨在为一款集投资交易与个性化理财建议于一体的**金融助手 Agent** 设计并实现一个高性能、可扩展的强化学习 (RL) 环境。该环境遵循 **OpenAI Gymnasium** 标准接口，整合多模态数据输入（技术指标、宏观经济数据、新闻情感），并提供精细化的奖励机制和**课程学习 (Curriculum Learning)** 支持，以确保 Agent 能够在追求收益的同时有效管控风险。
+This project designs and implements a high-performance, extensible Reinforcement Learning (RL) environment for a **Financial Assistant Agent** that integrates investment trading and personalized financial advice. The environment follows the **OpenAI Gymnasium** standard interface, integrates multimodal data inputs (technical indicators, macro-economic data, news sentiment), and provides a fine-grained multi-objective reward mechanism and **Curriculum Learning** support to ensure the Agent effectively manages risks while pursuing returns.
 
-## 2. 项目结构
+**Core Design Decisions:**
+- **Action Space:** Portfolio weight vector \`Box(0, 1, shape=(n_assets+1,))\`, normalized via internal softmax.
+- **Observation Space:** A sliding window of \`W\` time steps, flattened into a 1D vector, compatible with SB3 \`MlpPolicy\`.
 
-```
-financial_agent_rl/
+## 2. Project Structure
+
+\`\`\`
+rl-env-finance-assistant/
 ├── env/
-│   ├── __init__.py                # 包初始化
-│   ├── financial_env.py           # 核心环境类 (基于 Gymnasium 标准接口)
-│   ├── feature_engineering.py     # 特征工程模块 (支持宏观经济 + 新闻情感)
-│   ├── reward.py                  # 奖励函数模块
-│   ├── simulator.py               # 交易模拟引擎
-│   ├── task_generator.py          # 任务生成器 (支持难度感知生成)
-│   ├── scorer.py                  # 打分器：episode 级别综合评分
-│   └── curriculum_scheduler.py    # 课程学习调度器 (NEW)
+│   ├── __init__.py                # Package initialization and public exports
+│   ├── financial_env.py           # Core environment class (Gymnasium standard interface)
+│   ├── feature_engineering.py     # Feature engineering (Technical indicators + Macro + News sentiment)
+│   ├── reward.py                  # Multi-objective composite reward function
+│   ├── simulator.py               # Trading simulation engine (Commission + Slippage)
+│   ├── task_generator.py          # Task generator (Difficulty-aware + Multi-asset)
+│   ├── scorer.py                  # Episode comprehensive scorer
+│   └── curriculum_scheduler.py    # Curriculum learning scheduler
 ├── utils/
-│   └── metrics.py                 # 评估指标
+│   └── metrics.py                 # Evaluation metrics (Returns, Sharpe ratio, Max drawdown, etc.)
 ├── examples/
-│   ├── run_random_agent.py        # 随机 Agent 示例
-│   ├── run_training.py            # 使用 Stable-Baselines3 训练 PPO Agent 示例
-│   ├── run_task_generator_demo.py # 演示任务生成器与打分器功能
-│   └── run_enhanced_demo.py       # 演示增强功能：宏观经济 + 新闻 + 课程学习 (NEW)
-├── data/                          # 存放数据
-├── requirements.txt               # 依赖列表
-└── README.md                      # 项目说明文档
-```
+│   ├── run_random_agent.py        # Random Agent example
+│   ├── run_training.py            # Stable-Baselines3 PPO training example
+│   ├── run_task_generator_demo.py # Task generator and scorer demo
+│   └── run_enhanced_demo.py       # Enhanced features demo (Macro + News + Curriculum Learning)
+├── data/                          # Data directory
+├── requirements.txt               # Dependency list
+├── ImplementationPlan.md          # Implementation plan (Detailed module specifications)
+└── README.md
+\`\`\`
 
-## 3. 核心模块说明
+## 3. Architecture & Data Flow
 
-### 3.1 基础模块
+\`\`\`
+simulator.py   feature_engineering.py   reward.py   scorer.py
+      │                  │                  │            │
+      └──────────────────┴──────────────────┴────────────┘
+                          │
+                 task_generator.py   curriculum_scheduler.py
+                          │                  │
+                          └──────────────────┘
+                          │
+                   financial_env.py
+                          │
+                      __init__.py
+\`\`\`
 
-- **`env/financial_env.py`**: 实现了 `gymnasium.Env` 接口。整合特征工程、交易模拟、奖励计算、任务生成、综合打分和课程学习。
-- **`env/feature_engineering.py`**: 从原始金融数据中提取技术指标（RSI、布林带等）、宏观经济特征和新闻情感特征。
-- **`env/reward.py`**: 多目标复合奖励函数，考虑收益、波动率、交易成本和策略一致性。
-- **`env/simulator.py`**: 模拟金融市场交易机制，包括持仓管理、佣金和滑点。
-- **`env/task_generator.py`**: 为环境生成多样化任务，支持股票分析、投资组合管理和财务规划。
-- **`env/scorer.py`**: Episode 结束时提供综合评分报告。
+**Per-step Data Flow (\`step()\`):**
+1. Agent outputs raw action → Softmax normalization → Portfolio weights
+2. \`TradingSimulator.rebalance(weights, prices)\` → Execute trades, return transaction costs
+3. \`FeatureEngineering.compute_features()\` → Observation feature row
+4. \`RewardCalculator.compute()\` → Scalar reward
+5. At end of Episode: \`EpisodeScorer.score()\` → Score report → \`CurriculumScheduler.record_episode()\`
 
-### 3.2 增强模块 (NEW)
+## 4. Core Modules Description
 
-- **`env/curriculum_scheduler.py`**: 课程学习调度器，根据 Agent 历史表现动态调整任务难度，实现渐进式训练。
+| Module | Class | Responsibility |
+|------|-----|------|
+| \`simulator.py\` | \`TradingSimulator\` | Simulates trading execution: position management, commission, slippage |
+| \`feature_engineering.py\` | \`FeatureEngineering\` | Extracts technical indicators, macro features, and news sentiment features |
+| \`reward.py\` | \`RewardCalculator\` | Multi-objective composite reward: Return − Volatility − Cost − Drawdown |
+| \`scorer.py\` | \`EpisodeScorer\` | Episode-level comprehensive score (0–100), including difficulty factor |
+| \`task_generator.py\` | \`TaskGenerator\` | Generates diverse tasks with difficulty awareness and three task types |
+| \`curriculum_scheduler.py\` | \`CurriculumScheduler\` | Dynamically adjusts task difficulty based on Agent performance |
+| \`financial_env.py\` | \`FinancialAssistantEnv\` | Main Gymnasium environment class, integrating all above modules |
 
-## 4. 增强功能详解
+## 5. Environment Interface
 
-### 4.1 丰富环境反馈
+### 5.1 Action Space
 
-环境现在支持三种数据源的融合：
+\`\`\`python
+action_space = Box(low=0, high=1, shape=(n_assets+1,), dtype=np.float32)
+\`\`\`
 
-| 数据类型 | 特征 | 说明 |
-| :--- | :--- | :--- |
-| 技术指标 | log_return, volatility_5, volatility_20, sma_ratio, rsi_14, bb_width | 价格动量、均线、RSI、布林带 |
-| 新闻情感 | sentiment_score, news_volume, sentiment_momentum | 新闻情感得分、新闻量、情感动量 |
-| 宏观经济 | interest_rate_change, cpi_growth, unemployment_change | 利率变化、CPI 增长率、失业率变化 |
+The Agent outputs a raw weight vector \`[cash_w, asset1_w, asset2_w, ...]\`, which is normalized into portfolio ratios via internal softmax. In single-asset mode, \`shape=(2,)\` (Cash + 1 Stock).
 
-**启用方式：**
+### 5.2 Observation Space
 
-```python
+\`\`\`python
+observation_space = Box(low=-inf, high=inf, shape=(window_size × n_features,), dtype=np.float32)
+\`\`\`
+
+Sliding window observation, flattened into a 1D vector for SB3 \`MlpPolicy\` compatibility. Feature dimensions:
+
+| Feature Category | Dim per Asset | Description |
+|----------|-----------|------|
+| Technical Indicators | 6 | \`log_return\`, \`volatility_5\`, \`volatility_20\`, \`sma_ratio\`, \`rsi_14\`, \`bb_width\` |
+| Macro Economics | 3 (Global) | \`interest_rate_change\`, \`cpi_growth\`, \`unemployment_change\` |
+| News Sentiment | 3 (Global) | \`sentiment_score\`, \`news_volume\`, \`sentiment_momentum\` |
+| Portfolio State | n_assets+1 | Holding ratios for each asset + Cash ratio |
+| Step Progress | 1 | Current Step / Total Steps |
+
+\`\`\`
+n_features = max_assets × 6 + (max_assets + 1) + 1 + (3 if macro) + (3 if news)
+\`\`\`
+
+### 5.3 Interface Quick Reference
+
+| Interface | Description | Input/Output |
+|------|------|-----------|
+| \`env.reset()\` | Resets environment | Returns \`(observation, info)\` |
+| \`env.reset(options={"task_type": "..."})\` | Reset with specific task type | Supports \`stock_analysis\`, \`portfolio_management\`, \`financial_planning\` |
+| \`env.step(action)\` | Executes one trading step | Input \`action: np.array(shape=(n_assets+1,), range=[0,1])\` |
+| \`env.observation_space\` | Observation space | \`Box(shape=(window_size × n_features,))\` |
+| \`env.action_space\` | Action space | \`Box(shape=(n_assets+1,), low=0, high=1)\` |
+| \`env.simulator\` | Trading simulator | \`TradingSimulator\` instance |
+| \`env.current_task_meta\` | Current task metadata | Contains \`task_type\`, \`market_type\`, \`difficulty_score\`, etc. |
+| \`info["score_report"]\` | Score report | Contains \`final_score\`, \`metrics\`, \`market_info\`, etc. |
+
+## 6. Features in Detail
+
+### 6.1 Multimodal Data Fusion
+
+The environment supports the fusion of three data sources:
+
+| Data Type | Features | Description |
+|----------|------|------|
+| Technical Indicators | \`log_return\`, \`volatility_5\`, \`volatility_20\`, \`sma_ratio\`, \`rsi_14\`, \`bb_width\` | Price momentum, volatility, moving average, RSI, Bollinger Bands |
+| News Sentiment | \`sentiment_score\`, \`news_volume\`, \`sentiment_momentum\` | Sentiment score, news volume, sentiment momentum |
+| Macro Economics | \`interest_rate_change\`, \`cpi_growth\`, \`unemployment_change\` | Interest rate change, CPI growth, unemployment rate change |
+
+**Usage:**
+
+\`\`\`python
 from env.financial_env import FinancialAssistantEnv
 from env.task_generator import (
     TaskGenerator, create_multi_asset_data,
     create_simulated_macro_data, create_simulated_news_data
 )
 
-# 创建包含宏观和新闻数据的任务生成器
 data_dict = create_multi_asset_data(num_assets=3, days=500)
 macro_data = create_simulated_macro_data(days=500)
 news_data = create_simulated_news_data(days=500)
@@ -76,45 +143,39 @@ task_gen = TaskGenerator(
     news_data=news_data
 )
 
-# 启用宏观和新闻特征
 env = FinancialAssistantEnv(
     task_generator=task_gen,
     include_macro=True,
     include_news=True
 )
-# 观测空间维度: 12 (市场特征) + 3 (账户特征) = 15
-```
+\`\`\`
 
-### 4.2 课程学习 (Curriculum Learning)
+### 6.2 Curriculum Learning
 
-课程学习调度器根据 Agent 的表现自动调整任务难度：
+The curriculum learning scheduler automatically adjusts task difficulty based on Agent performance:
 
-**难度等级：**
+| Difficulty Range | Label | Characteristics |
+|----------|------|------|
+| 0.0 – 0.2 | Beginner | Bull market, low volatility, low transaction costs |
+| 0.2 – 0.4 | Easy | Bull/Side-ways market, moderate volatility |
+| 0.4 – 0.6 | Medium | Side-ways market, standard parameters |
+| 0.6 – 0.8 | Hard | Bear market, high volatility, high transaction costs |
+| 0.8 – 1.0 | Expert | Bear market, extreme volatility, complex tasks |
 
-| 难度范围 | 标签 | 特征 |
-| :--- | :--- | :--- |
-| 0.0 - 0.2 | Beginner | 牛市、低波动、低交易成本 |
-| 0.2 - 0.4 | Easy | 牛市/震荡、中等波动 |
-| 0.4 - 0.6 | Medium | 震荡市、标准参数 |
-| 0.6 - 0.8 | Hard | 熊市、高波动、高交易成本 |
-| 0.8 - 1.0 | Expert | 熊市、极端波动、复杂任务 |
+**Usage:**
 
-**使用方式：**
-
-```python
+\`\`\`python
 from env.curriculum_scheduler import CurriculumScheduler
 
-# 创建调度器
 scheduler = CurriculumScheduler(
-    initial_difficulty=0.1,       # 从简单开始
-    promotion_threshold=60.0,     # 平均得分 > 60 则升级
-    demotion_threshold=20.0,      # 平均得分 < 20 则降级
-    difficulty_step_up=0.1,       # 每次升级增加 0.1
-    difficulty_step_down=0.05,    # 每次降级减少 0.05
-    exploration_rate=0.1          # 10% 概率探索新难度
+    initial_difficulty=0.1,
+    promotion_threshold=50.0,
+    demotion_threshold=10.0,
+    difficulty_step_up=0.1,
+    difficulty_step_down=0.05,
+    exploration_rate=0.1
 )
 
-# 创建带课程学习的环境
 env = FinancialAssistantEnv(
     task_generator=task_gen,
     curriculum_scheduler=scheduler,
@@ -122,84 +183,86 @@ env = FinancialAssistantEnv(
     include_news=True
 )
 
-# 训练循环中自动调整难度
+# Difficulty automatically updates within the training loop at episode end
 for episode in range(100):
     obs, info = env.reset()
     done = False
     while not done:
-        action = your_model.predict(obs)
+        action, _states = model.predict(obs)
         obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
 
-    # 课程学习在 episode 结束时自动更新难度
-    if "curriculum_stats" in info:
-        stats = info["curriculum_stats"]
-        print(f"Current Difficulty: {stats['current_difficulty']:.2f} ({stats['difficulty_label']})")
-```
+    # Curriculum updates difficulty automatically; you can check stats
+    stats = scheduler.get_stats()
+    print(f"Difficulty: {stats['current_difficulty']:.2f} ({stats['difficulty_label']})")
+\`\`\`
 
-### 4.3 难度感知任务生成
+### 6.3 Difficulty-Aware Task Generation
 
-任务生成器现在支持 `target_difficulty` 参数，根据难度自动调整：
+The task generator supports the \`target_difficulty\` parameter to automatically adjust market type, transaction costs, and time windows:
 
-```python
-# 生成特定难度的任务
+\`\`\`python
 easy_task = task_gen.generate_task(task_type="stock_analysis", target_difficulty=0.1)
 hard_task = task_gen.generate_task(task_type="stock_analysis", target_difficulty=0.8)
+\`\`\`
 
-# 难度影响的参数：市场类型偏好、时间窗口、交易成本、初始资金
-```
+**Three Task Types:**
 
-## 5. 安装依赖
+| Task Type | Asset Count | Additional Parameters |
+|----------|---------|----------|
+| \`stock_analysis\` | 1 | \`risk_profile\` |
+| \`portfolio_management\` | 2–3 | \`risk_profile\` |
+| \`financial_planning\` | 1–2 | \`risk_profile\`, \`current_age\`, \`retirement_age\` |
 
-```bash
+### 6.4 Reward Mechanism
+
+Multi-objective composite reward function to balance return and risk:
+
+\`\`\`
+reward = w₁ · step_return − w₂ · volatility_penalty − w₃ · transaction_cost_penalty − w₄ · drawdown_penalty
+\`\`\`
+
+| Component | Formula | Purpose |
+|------|------|------|
+| \`step_return\` | \`(curr − prev) / prev\` | Reward positive returns |
+| \`volatility_penalty\` | \`std(last 20 returns)\` | Penalize instability |
+| \`transaction_cost_penalty\` | \`transaction_cost / prev_net_worth\` | Discourage over-trading |
+| \`drawdown_penalty\` | \`max(0, (peak − curr) / peak)\` | Penalize drawdown from peak |
+
+## 7. Installation & Quick Start
+
+### 7.1 Install Dependencies
+
+\`\`\`bash
 pip install -r requirements.txt
-```
+\`\`\`
 
-## 6. 快速开始
+### 7.2 Run Enhanced Feature Demo (Recommended)
 
-### 6.1 运行增强功能演示（推荐）
-
-```bash
-cd financial_agent_rl
+\`\`\`bash
 python examples/run_enhanced_demo.py
-```
+\`\`\`
 
-此演示包含三个部分：
-1. **丰富环境反馈演示**：展示宏观经济和新闻情感特征的集成
-2. **课程学习演示**：展示 20 个 episode 中难度的动态调整
-3. **难度感知任务生成演示**：展示不同难度等级的任务参数差异
+Includes three parts:
+1. **Multimodal Data Fusion Demo**: Integration of macro and news sentiment features.
+2. **Curriculum Learning Demo**: Dynamic difficulty adjustment over 20 episodes.
+3. **Difficulty-Aware Task Generation Demo**: Task parameter differences across difficulty levels.
 
-### 6.2 运行任务生成器与打分器演示
+### 7.3 Other Examples
 
-```bash
-cd financial_agent_rl
-python examples/run_task_generator_demo.py
-```
+\`\`\`bash
+python examples/run_task_generator_demo.py    # Task generator and scorer
+python examples/run_random_agent.py           # Random Agent baseline
+python examples/run_training.py              # SB3 PPO training
+\`\`\`
 
-### 6.3 运行随机 Agent
+## 8. Integrating Custom Models
 
-```bash
-cd financial_agent_rl
-python examples/run_random_agent.py
-```
+This environment follows the standard **Gymnasium** interface, so any Gymnasium-compatible RL algorithm can be used.
 
-### 6.4 训练 PPO Agent
+### 8.1 Basic Integration
 
-```bash
-cd financial_agent_rl
-python examples/run_training.py
-```
-
-## 7. 如何接入自定义模型进行测试与训练
-
-本环境遵循标准的 **Gymnasium** 接口，因此任何兼容 Gymnasium 的 RL 算法或自定义模型都可以轻松接入。
-
-### 7.1 基本接入流程
-
-```python
-import sys
-sys.path.append("path/to/financial_agent_rl")
-
+\`\`\`python
 from env.financial_env import FinancialAssistantEnv, generate_dummy_data
 from env.task_generator import (
     TaskGenerator, create_multi_asset_data,
@@ -207,11 +270,11 @@ from env.task_generator import (
 )
 from env.curriculum_scheduler import CurriculumScheduler
 
-# 方式一：使用固定数据（适合快速测试）
+# Option 1: Fixed data (suitable for quick testing)
 df = generate_dummy_data(num_days=500)
 env = FinancialAssistantEnv(df=df, initial_balance=10000)
 
-# 方式二：使用任务生成器 + 课程学习（推荐）
+# Option 2: Task Generator + Curriculum Learning (Recommended)
 data_dict = create_multi_asset_data(num_assets=5, days=1000)
 macro_data = create_simulated_macro_data(days=1000)
 news_data = create_simulated_news_data(days=1000)
@@ -230,29 +293,25 @@ env = FinancialAssistantEnv(
     include_macro=True,
     include_news=True
 )
-```
+\`\`\`
 
-### 7.2 接入自定义模型进行测试
+### 8.2 Testing Custom Models
 
-```python
+\`\`\`python
+import numpy as np
+
 class MyCustomModel:
     def predict(self, observation):
         """
-        输入: observation (numpy array) - 环境的观测向量
-              启用所有特征时为 15 维:
-              - 12 个市场特征 (技术指标 + 新闻情感 + 宏观经济)
-              - 3 个账户特征 (balance, shares_held, net_worth)
-
-        输出: action (numpy array, shape=(1,)) - 取值范围 [-1, 1]
+        Input: observation — Flattened sliding window feature vector
+              shape = (window_size × n_features,)
+        Output: action — Portfolio weight vector
+              shape = (n_assets+1,), range = [0, 1]
+              The environment handles softmax normalization internally.
         """
-        import numpy as np
-        rsi = observation[4]
-        if rsi < -1.0:
-            return np.array([0.5])
-        elif rsi > 1.0:
-            return np.array([-0.5])
-        else:
-            return np.array([0.0])
+        # Simple example: Equal weighting strategy
+        n = env.action_space.shape[0]
+        return np.ones(n) / n
 
 model = MyCustomModel()
 obs, info = env.reset()
@@ -264,91 +323,73 @@ while not done:
 
 if "score_report" in info:
     report = info["score_report"]
-    print(f"综合评分: {report['final_score']}")
-```
+    print(f"Comprehensive Score: {report['final_score']}")
+\`\`\`
 
-### 7.3 接入 Stable-Baselines3
+### 8.3 Stable-Baselines3
 
-```python
+\`\`\`python
 from stable_baselines3 import PPO, SAC
 
 env = FinancialAssistantEnv(task_generator=task_gen, include_macro=True, include_news=True)
 
-# PPO 训练
+# PPO Training
 model = PPO("MlpPolicy", env, verbose=1, learning_rate=3e-4)
 model.learn(total_timesteps=50000)
 model.save("my_financial_agent")
 
-# SAC 训练（推荐用于连续动作空间）
+# SAC Training (Recommended for continuous action spaces)
 model = SAC("MlpPolicy", env, verbose=1)
 model.learn(total_timesteps=50000)
-```
+\`\`\`
 
-### 7.4 接入 LLM-based Agent
+### 8.4 LLM-based Agent
 
-```python
+\`\`\`python
 def obs_to_prompt(obs, info):
-    """将观测向量转换为自然语言提示"""
-    prompt = f"""你是一个金融交易助手。请根据以下市场信息做出交易决策。
+    """Convert observation vector to a natural language prompt"""
+    # Note: obs is a flattened window; parse according to n_features.
+    # Here is an example mapping features for a single asset, window_size=1.
+    prompt = f"""You are a financial trading assistant. Please make a portfolio decision based on the following market info.
 
-当前市场状态:
-- 对数收益率: {obs[0]:.4f}
-- 短期波动率(5日): {obs[1]:.4f}
-- 长期波动率(20日): {obs[2]:.4f}
-- 均线比率(SMA10/SMA30): {obs[3]:.4f}
-- RSI(14): {obs[4]:.4f}
-- 布林带宽度: {obs[5]:.4f}
-- 市场情绪得分: {obs[6]:.4f}
-- 新闻量: {obs[7]:.4f}
-- 情绪动量: {obs[8]:.4f}
-- 利率变化: {obs[9]:.4f}
-- CPI增长率: {obs[10]:.4f}
-- 失业率变化: {obs[11]:.4f}
+Current Market Features (6 technical indicators per asset):
+- Log Return (log_return)
+- Short-term Volatility (volatility_5)
+- Long-term Volatility (volatility_20)
+- moving Average Ratio (sma_ratio)
+- RSI(14)
+- Bollinger Band Width (bb_width)
 
-账户状态:
-- 可用余额: {obs[12]:.2f}
-- 持仓数量: {obs[13]:.4f}
-- 账户净值: {obs[14]:.2f}
+Portfolio State:
+- Cash Ratio
+- Asset Holding Ratios
+- Step Progress
 
-请输出一个 -1 到 1 之间的数字作为交易决策。"""
+Please output a portfolio weight vector [cash_weight, asset1_weight, ...],
+where each value is in [0, 1]. No normalization required (the environment handles softmax)."""
     return prompt
-```
+\`\`\`
 
-### 7.5 环境接口速查表
+## 9. Data Description
 
-| 接口 | 说明 | 输入/输出 |
-| :--- | :--- | :--- |
-| `env.reset()` | 重置环境 | 返回 `(observation, info)` |
-| `env.reset(options={"task_type": "..."})` | 指定任务类型重置 | 支持 `stock_analysis`, `portfolio_management`, `financial_planning` |
-| `env.step(action)` | 执行一步交易 | 输入 `action: np.array(shape=(1,), range=[-1,1])` |
-| `env.observation_space` | 观测空间 | 基础: `Box(shape=(15,))` (12 市场 + 3 账户) |
-| `env.action_space` | 动作空间 | `Box(shape=(1,), low=-1, high=1)` |
-| `env.current_task_meta` | 当前任务元数据 | 包含 `task_type`, `market_type`, `difficulty_score` 等 |
-| `info["score_report"]` | 评分报告 | 包含 `final_score`, `metrics` 等 |
-| `info["curriculum_stats"]` | 课程学习统计 | 包含 `current_difficulty`, `promotions`, `demotions` 等 |
+The environment supports three data sources:
 
-## 8. 数据说明
-
-环境支持三种数据源：
-
-```python
-# 1. 股票行情数据（必需）
+\`\`\`python
+# 1. Stock Market Data (Required)
 import yfinance as yf
 data_dict = {}
 for ticker in ["AAPL", "GOOGL", "MSFT"]:
     data_dict[ticker] = yf.download(ticker, start="2020-01-01", end="2024-12-31")
 
-# 2. 宏观经济数据（可选）
-# 可通过 FRED API 获取真实数据，或使用模拟数据
+# 2. Macro-economic Data (Optional)
 from env.task_generator import create_simulated_macro_data
 macro_data = create_simulated_macro_data(days=1000)
 
-# 3. 新闻情感数据（可选）
-# 可通过 Finnhub/NewsAPI 获取真实数据，或使用模拟数据
+# 3. News Sentiment Data (Optional)
 from env.task_generator import create_simulated_news_data
 news_data = create_simulated_news_data(days=1000)
-```
+\`\`\`
 
-## 9. 许可证
+## 10. License
 
-本项目采用 MIT 许可证。
+This project is licensed under the MIT License.
