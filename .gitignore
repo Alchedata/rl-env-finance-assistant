@@ -104,9 +104,8 @@ celerybeat.pid
 # Environments
 .env
 .venv
-env/
 venv/
-ENV/
+# env/ (Removed to allow tracking of the project's env/ directory)
 env.bak/
 venv.bak/
 
