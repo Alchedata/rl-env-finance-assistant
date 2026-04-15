@@ -136,8 +136,7 @@ base_score = clamp(base_score, 0, 100)
 final_score = clamp(base_score × difficulty_multiplier, 0, 100)
 ```
 
-The difficulty multiplier (`1.0 + difficulty × 0.5`, range 1.0–1.5) rewards agents that perform well on harder tasks.
-
+The difficulty multiplier (`1.0 + difficulty × 0.5`, range 1.0–1.5) rewards agents that perform well 
 ### 3.5 TaskGenerator (`env/task_generator.py`)
 
 Procedurally generates episodes with controlled difficulty.
